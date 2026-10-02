@@ -173,6 +173,10 @@ type mapping struct {
 	key       MappingKey
 	public    netip.AddrPort
 	expiresAt time.Time
+	// hairpin is non-nil when this mapping carries a loopback session to a
+	// published local endpoint. The flow lives and dies with this mapping, so
+	// a recycled port can never inherit a previous owner's reply identity.
+	hairpin *hairpinFlow
 }
 
 func (m *mapping) touch(now time.Time) {
@@ -190,7 +194,6 @@ type Service struct {
 	mappings            map[MappingKey]*mapping
 	byPort              map[uint16]*mapping
 	publications        map[uint16]Publication
-	hairpins            map[uint16]hairpinFlow
 	publicationRevision uint64
 }
 
@@ -373,11 +376,18 @@ func (s *Service) deleteMappingLocked(m *mapping) {
 	}
 }
 
+// smallestFreePortLocked returns the lowest port owned neither by an active
+// mapping nor by a fixed publication, so one public port never identifies two
+// different objects at the same time.
 func (s *Service) smallestFreePortLocked() (uint16, bool) {
 	for port := MinPublicPort; port <= MaxPublicPort; port++ {
-		if _, occupied := s.byPort[port]; !occupied {
-			return port, true
+		if _, occupied := s.byPort[port]; occupied {
+			continue
 		}
+		if _, published := s.publications[port]; published {
+			continue
+		}
+		return port, true
 	}
 	return 0, false
 }

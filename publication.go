@@ -13,6 +13,11 @@ type Publication struct {
 }
 
 // Publish replaces a simulated local peer's public UDP endpoint.
+//
+// Fixed publications and dynamic mappings share one port pool: Publish fails
+// without changing the revision or port ownership while the port is owned by
+// an active mapping. A successful replacement immediately terminates the
+// previous publication identity's loopback sessions.
 func (s *Service) Publish(port uint16, internal netip.AddrPort, allowed []netip.AddrPort, expected uint64) (Publication, error) {
 	target, ok := validUDPAddrPort(internal)
 	if !ok || target.Addr() == s.publicIP || port < MinPublicPort || port > MaxPublicPort {
@@ -31,15 +36,24 @@ func (s *Service) Publish(port uint16, internal netip.AddrPort, allowed []netip.
 	if expected != s.publicationRevision {
 		return Publication{}, fmt.Errorf("publication revision conflict")
 	}
+	now := s.clock.Now()
+	s.sweepExpiredLocked(now)
+	if _, occupied := s.byPort[port]; occupied {
+		return Publication{}, fmt.Errorf("public port %d is owned by an active mapping", port)
+	}
+	// Replacing the publication retires the old identity's loopback sessions.
+	s.terminatePublicationSessionsLocked(port)
+	s.publicationRevision++
 	if s.publications == nil {
 		s.publications = map[uint16]Publication{}
 	}
-	s.publicationRevision++
 	rule := Publication{Port: port, Internal: target, Allowed: peers, Revision: s.publicationRevision}
 	s.publications[port] = rule
 	return rule, nil
 }
 
+// Unpublish removes a publication and immediately terminates its loopback
+// sessions, so the revoked identity's replies find no session to enter.
 func (s *Service) Unpublish(port uint16, expected uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -49,9 +63,21 @@ func (s *Service) Unpublish(port uint16, expected uint64) error {
 	if _, ok := s.publications[port]; !ok {
 		return fmt.Errorf("publication not found")
 	}
+	s.terminatePublicationSessionsLocked(port)
 	delete(s.publications, port)
 	s.publicationRevision++
 	return nil
+}
+
+// terminatePublicationSessionsLocked ends every loopback session created under
+// the publication on pubPort. Deleting a client mapping deletes its hairpin
+// flow with it, retiring the old publication identity immediately.
+func (s *Service) terminatePublicationSessionsLocked(pubPort uint16) {
+	for _, m := range s.byPort {
+		if m.hairpin != nil && m.hairpin.PeerPort == pubPort {
+			s.deleteMappingLocked(m)
+		}
+	}
 }
 
 func (s *Service) PublicationRevision() uint64 {
